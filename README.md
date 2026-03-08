@@ -1,4 +1,4 @@
-# 🔬 Paper Read Agent
+# 🔬 Research Paper Mining Agent
 
 An AI-powered research assistant that discovers, evaluates, and explains AI/ML papers. Runs fully locally — just add your Anthropic API key.
 
