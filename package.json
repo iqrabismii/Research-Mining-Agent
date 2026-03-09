@@ -25,7 +25,7 @@
     "@mastra/mcp": "^1.1.0",
     "@mastra/memory": "^1.6.1",
     "@mastra/observability": "^1.3.1",
-    "nodemailer": "^6.9.0",
+    "nodemailer": "6.9.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

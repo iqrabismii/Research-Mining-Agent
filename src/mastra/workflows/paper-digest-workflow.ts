@@ -1,57 +1,58 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { createTransport } from '../tools/send-email';
+import { searchArxiv } from '../tools/search-arxiv';
+import { searchSemanticScholar } from '../tools/search-semantic-scholar';
+import { searchHuggingFacePapers } from '../tools/search-huggingface-papers';
 
-// ─── Step 1: Fetch papers from all sources ─────────────────────────────────
+// ─── Step 1: Fetch papers — calls tools directly (no agent, no token overhead) ─
 
 const fetchPapersStep = createStep({
   id: 'fetch-papers',
-  description: 'Queries arxiv, Semantic Scholar, and HuggingFace for weekly top papers',
+  description: 'Fetches papers directly from arxiv, Semantic Scholar, and HuggingFace',
   inputSchema: z.object({
     topics: z.string().default('large language models,reasoning,agents,multimodal'),
-    maxPerSource: z.number().default(15),
-    recipientEmail: z.string().optional().describe('Send to a single email instead of all subscribers'),
+    maxPerSource: z.number().default(10),
+    recipientEmail: z.string().optional(),
   }),
   outputSchema: z.object({
     rawContent: z.string(),
     recipientEmail: z.string().optional(),
   }),
-  execute: async ({ inputData, mastra }) => {
-    const agent = mastra?.getAgent('paperResearchAgent');
-    if (!agent) throw new Error('paperResearchAgent not found');
+  execute: async ({ inputData }) => {
+    const query = inputData.topics.split(',').map((t) => t.trim()).join(' OR ');
+    const max = inputData.maxPerSource;
 
-    const query = inputData.topics
-      .split(',')
-      .map((t) => t.trim())
-      .join(' OR ');
-
-    const [arxivRes, scholarRes, hfRes] = await Promise.all([
-      agent.generate([{ role: 'user', content: `Call searchArxiv with query="${query}", maxResults=${inputData.maxPerSource}. Return the JSON result.` }]),
-      agent.generate([{ role: 'user', content: `Call searchSemanticScholar with query="${query}", maxResults=${inputData.maxPerSource}, minYear=${new Date().getFullYear()}. Return the JSON result.` }]),
-      agent.generate([{ role: 'user', content: `Call searchHuggingFacePapers with query="${query}", limit=${inputData.maxPerSource}. Return the JSON result.` }]),
+    const [arxiv, scholar, hf] = await Promise.all([
+      searchArxiv.execute({ query, maxResults: max, categories: ['cs.AI', 'cs.LG', 'cs.CL'] }),
+      searchSemanticScholar.execute({ query, maxResults: max, minYear: new Date().getFullYear() }),
+      searchHuggingFacePapers.execute({ query, limit: max }),
     ]);
 
     const rawContent = [
-      '=== ARXIV ===', arxivRes.text,
-      '=== SEMANTIC SCHOLAR ===', scholarRes.text,
-      '=== HUGGINGFACE PAPERS ===', hfRes.text,
+      '=== ARXIV ===',
+      JSON.stringify(arxiv.papers.slice(0, max)),
+      '=== SEMANTIC SCHOLAR ===',
+      JSON.stringify(scholar.papers.slice(0, max)),
+      '=== HUGGINGFACE PAPERS ===',
+      JSON.stringify(hf.papers.slice(0, max)),
     ].join('\n\n');
 
     return { rawContent, recipientEmail: inputData.recipientEmail };
   },
 });
 
-// ─── Step 2: Summarize and rank ─────────────────────────────────────────────
+// ─── Step 2: Summarize — one focused LLM call, no memory ────────────────────
 
 const summarizePapersStep = createStep({
   id: 'summarize-papers',
-  description: 'Generates structured summaries and selects the top 5–10 papers',
+  description: 'Ranks and summarises the top papers using a single focused LLM call',
   inputSchema: z.object({
     rawContent: z.string(),
     recipientEmail: z.string().optional(),
   }),
   outputSchema: z.object({
-    summariesJson: z.string().describe('JSON array of paper summaries'),
+    summariesJson: z.string(),
     weekOf: z.string(),
     paperCount: z.number(),
     recipientEmail: z.string().optional(),
@@ -60,38 +61,21 @@ const summarizePapersStep = createStep({
     const agent = mastra?.getAgent('paperResearchAgent');
     if (!agent) throw new Error('paperResearchAgent not found');
 
-    const response = await agent.generate([{
-      role: 'user',
-      content: `
-Here is raw output from three paper search sources (arxiv, Semantic Scholar, HuggingFace):
+    const response = await agent.generate(
+      [{ role: 'user', content: `
+You are given raw paper data from arxiv, Semantic Scholar, and HuggingFace.
 
 ${inputData.rawContent}
 
-Based on these results:
-1. Deduplicate papers by title
-2. Select the top 5-10 most impactful papers from the past 7 days
-3. For each paper produce a structured summary in this exact JSON format:
+Tasks:
+1. Deduplicate by title
+2. Select the top 5-7 most impactful recent papers
+3. Return ONLY this JSON (no markdown, no extra text):
 
-{
-  "summaries": [
-    {
-      "title": "...",
-      "authors": "Author One, Author Two",
-      "tldr": "One plain-English sentence summary",
-      "problem": "What challenge it addresses",
-      "method": "Key idea in 2-3 sentences",
-      "results": "Headline benchmark numbers or qualitative claims",
-      "whyItMatters": "Impact on the field",
-      "tags": "LLM, Reasoning, Efficiency",
-      "url": "https://arxiv.org/abs/...",
-      "source": "arxiv"
-    }
-  ]
-}
-
-Return ONLY valid JSON, no markdown fences, no extra text.
-`,
-    }]);
+{"summaries":[{"title":"...","authors":"Author One, Author Two","tldr":"One plain-English sentence","problem":"1-2 sentences","method":"2-3 sentences","results":"Benchmark numbers if available","whyItMatters":"1-2 sentences","tags":"tag1, tag2","url":"https://...","source":"arxiv"}]}
+` }],
+      { memoryOptions: { lastMessages: 0 } },  // skip memory — this is a one-shot task
+    );
 
     let summariesJson = '[]';
     let paperCount = 0;
@@ -104,16 +88,15 @@ Return ONLY valid JSON, no markdown fences, no extra text.
     }
 
     const weekOf = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
-
     return { summariesJson, weekOf, paperCount, recipientEmail: inputData.recipientEmail };
   },
 });
 
-// ─── Step 3: Build HTML and broadcast to subscribers ────────────────────────
+// ─── Step 3: Build HTML and send email ──────────────────────────────────────
 
 const sendDigestStep = createStep({
   id: 'send-digest',
-  description: 'Builds HTML digest and sends to all subscribers (or a single recipient if specified)',
+  description: 'Builds HTML digest and emails it',
   inputSchema: z.object({
     summariesJson: z.string(),
     weekOf: z.string(),
@@ -140,14 +123,14 @@ const sendDigestStep = createStep({
     let summaries: PaperSummary[] = [];
     try { summaries = JSON.parse(inputData.summariesJson) as PaperSummary[]; } catch { summaries = []; }
 
-    const subject = `Weekly AI Paper Digest — Week of ${inputData.weekOf}`;
+    const subject = `AI Paper Digest — ${inputData.weekOf}`;
 
     const papersHtml = summaries.map((p, i) => `
 <div style="margin-bottom:32px;padding-bottom:24px;border-bottom:1px solid #e5e7eb;">
   <h2 style="margin:0 0 4px;font-size:18px;">
     ${i + 1}. <a href="${p.url}" style="color:#1d4ed8;text-decoration:none;">${p.title}</a>
   </h2>
-  <p style="margin:0 0 8px;color:#6b7280;font-size:14px;">${p.authors} &middot; <em>${p.source}</em></p>
+  <p style="margin:0 0 8px;color:#6b7280;font-size:14px;">${p.authors} · <em>${p.source}</em></p>
   <p style="margin:0 0 6px;"><strong>TL;DR:</strong> ${p.tldr}</p>
   <p style="margin:0 0 6px;"><strong>Problem:</strong> ${p.problem}</p>
   <p style="margin:0 0 6px;"><strong>Method:</strong> ${p.method}</p>
@@ -157,50 +140,31 @@ const sendDigestStep = createStep({
 </div>`).join('');
 
     const htmlBody = `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
+<html><head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:700px;margin:0 auto;padding:32px 16px;color:#111827;">
   <h1 style="font-size:24px;border-bottom:2px solid #111827;padding-bottom:12px;">🔬 AI Paper Digest</h1>
-  <p style="color:#6b7280;">Week of ${inputData.weekOf} &mdash; ${summaries.length} papers curated from arxiv, Semantic Scholar &amp; HuggingFace</p>
+  <p style="color:#6b7280;">${inputData.weekOf} — ${summaries.length} papers from arxiv · Semantic Scholar · HuggingFace</p>
   ${papersHtml}
   <hr style="margin-top:32px;border:none;border-top:1px solid #e5e7eb;">
   <p style="color:#9ca3af;font-size:12px;">
-    Generated by <a href="https://github.com/iqrabismii/research-paper">Paper Read Agent</a> &middot;
-    <a href="https://arxiv.org">arxiv</a> &middot;
-    <a href="https://semanticscholar.org">Semantic Scholar</a> &middot;
-    <a href="https://huggingface.co/papers">HuggingFace Papers</a>
+    Generated by <a href="https://github.com/iqrabismii/research-paper">Paper Read Agent</a>
   </p>
-</body>
-</html>`;
+</body></html>`;
 
     const recipient = inputData.recipientEmail ?? process.env.DIGEST_TO_EMAIL ?? '';
-    if (!recipient) {
-      throw new Error('No recipient email. Pass recipientEmail or set DIGEST_TO_EMAIL in .env');
-    }
+    if (!recipient) return { sent: false, recipientCount: 0, paperCount: summaries.length, digestSubject: subject };
 
     const smtpReady = !!(process.env.SMTP_USER && process.env.SMTP_PASS);
-    if (!smtpReady) {
+    if (!smtpReady) return { sent: false, recipientCount: 0, paperCount: summaries.length, digestSubject: subject };
+
+    try {
+      const transporter = createTransport();
+      const from = process.env.SMTP_FROM ?? process.env.SMTP_USER ?? '';
+      await transporter.sendMail({ from, to: recipient, subject, html: htmlBody });
+      return { sent: true, recipientCount: 1, paperCount: summaries.length, digestSubject: subject };
+    } catch {
       return { sent: false, recipientCount: 0, paperCount: summaries.length, digestSubject: subject };
     }
-
-    const transporter = createTransport();
-    const fromEmail = process.env.SMTP_FROM ?? process.env.SMTP_USER ?? '';
-
-    let sentCount = 0;
-    try {
-      await transporter.sendMail({ from: fromEmail, to: recipient, subject, html: htmlBody });
-      sentCount = 1;
-    } catch {
-      // fall through — sentCount stays 0
-      }
-    }
-
-    return {
-      sent: sentCount > 0,
-      recipientCount: sentCount,
-      paperCount: summaries.length,
-      digestSubject: subject,
-    };
   },
 });
 
@@ -209,9 +173,9 @@ const sendDigestStep = createStep({
 export const paperDigestWorkflow = createWorkflow({
   id: 'paper-digest-workflow',
   inputSchema: z.object({
-    topics: z.string().default('large language models,reasoning,agents,multimodal').describe('Comma-separated research topics'),
-    maxPerSource: z.number().default(15),
-    recipientEmail: z.string().optional().describe('Email to send the digest to (falls back to DIGEST_TO_EMAIL env var)'),
+    topics: z.string().default('large language models,reasoning,agents,multimodal'),
+    maxPerSource: z.number().default(10),
+    recipientEmail: z.string().optional().describe('Email to send digest to (falls back to DIGEST_TO_EMAIL env var)'),
   }),
   outputSchema: z.object({
     sent: z.boolean(),

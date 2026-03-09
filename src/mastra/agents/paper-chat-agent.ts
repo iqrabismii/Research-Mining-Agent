@@ -76,11 +76,7 @@ Use sendEmail if the user says yes. If email is not configured, relay the setup 
   },
   memory: new Memory({
     options: {
-      lastMessages: 20,
-      observationalMemory: {
-        model: 'anthropic/claude-haiku-4-5-20251001',
-        scope: 'thread',
-      },
+      lastMessages: 8,
     },
   }),
 });

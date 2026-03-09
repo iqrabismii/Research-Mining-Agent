@@ -43,11 +43,7 @@ If email is not configured, the tool will tell the user how to set it up — jus
   },
   memory: new Memory({
     options: {
-      lastMessages: 10,
-      observationalMemory: {
-        model: 'anthropic/claude-haiku-4-5-20251001',
-        scope: 'thread',
-      },
+      lastMessages: 5,
     },
   }),
 });
